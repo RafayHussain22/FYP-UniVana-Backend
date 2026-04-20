@@ -11,6 +11,7 @@
 
 const { spawn } = require("child_process");
 const path = require("path");
+const AdminJob = require("./models/adminJob");
 
 // Where the scrapper scripts live (sibling directory)
 const SCRAPPERS_DIR = path.resolve(__dirname, "../Scrappers");
@@ -114,6 +115,7 @@ function startJob(scriptKey) {
     startedAt: new Date(),
     finishedAt: null,
     exitCode: null,
+    logs: [],
     results: { created: [], updated: [], unchanged: 0, errors: [] },
   };
 
@@ -122,8 +124,14 @@ function startJob(scriptKey) {
   // Spawn the process
   const child = spawn(script.command, script.args, {
     cwd: script.cwd,
-    env: { ...process.env }, // inherit all env vars (MONGO_URI, etc.)
+    env: { ...process.env, PYTHONUNBUFFERED: "1" }, // inherit env + unbuffered python stdout
   });
+
+  // Append a line to job.logs, keeping only the most recent 5000 lines
+  const pushLog = (line) => {
+    job.logs.push(line);
+    if (job.logs.length > 5000) job.logs.shift();
+  };
 
   // Read stdout line by line
   let stdoutBuffer = "";
@@ -133,7 +141,11 @@ function startJob(scriptKey) {
     // Keep the last incomplete line in the buffer
     stdoutBuffer = lines.pop();
     for (const line of lines) {
-      if (line.trim()) parseLine(line, job.results);
+      const trimmed = line.trimEnd();
+      if (trimmed) {
+        pushLog(trimmed);
+        parseLine(trimmed, job.results);
+      }
     }
   });
 
@@ -141,27 +153,50 @@ function startJob(scriptKey) {
   child.stderr.on("data", (chunk) => {
     const lines = chunk.toString().split("\n");
     for (const line of lines) {
-      if (line.trim()) {
-        job.results.errors.push(line.trim());
+      const trimmed = line.trim();
+      if (trimmed) {
+        pushLog(trimmed);
+        job.results.errors.push(trimmed);
       }
     }
   });
 
-  child.on("close", (code) => {
+  const persist = async () => {
+    try {
+      await AdminJob.create({
+        scriptKey: job.scriptKey,
+        label: job.label,
+        status: job.status,
+        startedAt: job.startedAt,
+        finishedAt: job.finishedAt,
+        exitCode: job.exitCode,
+        logs: job.logs,
+        results: job.results,
+      });
+    } catch (err) {
+      console.error("[adminJobs] failed to save job to DB:", err.message);
+    }
+  };
+
+  child.on("close", async (code) => {
     // Process any remaining data in the buffer
     if (stdoutBuffer.trim()) {
+      pushLog(stdoutBuffer.trim());
       parseLine(stdoutBuffer, job.results);
     }
     job.status = code === 0 ? "completed" : "failed";
     job.exitCode = code;
     job.finishedAt = new Date();
+    await persist();
   });
 
-  child.on("error", (err) => {
+  child.on("error", async (err) => {
     job.status = "failed";
     job.exitCode = -1;
     job.finishedAt = new Date();
+    pushLog(err.message);
     job.results.errors.push(err.message);
+    await persist();
   });
 
   return job;

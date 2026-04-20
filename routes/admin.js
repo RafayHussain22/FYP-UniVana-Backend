@@ -4,6 +4,7 @@ const adminAuth = require("../middleware/adminAuth");
 const superAdminAuth = require("../middleware/superAdminAuth");
 const { startJob, getJobs, getJob } = require("../adminJobs");
 const User = require("../models/user");
+const AdminJob = require("../models/adminJob");
 
 const router = express.Router();
 
@@ -28,6 +29,19 @@ router.post("/jobs/:scriptKey/run", (req, res) => {
 // GET /admin/jobs  —  list all jobs (frontend polls this)
 router.get("/jobs", (req, res) => {
   res.json({ ok: true, jobs: getJobs() });
+});
+
+// GET /admin/jobs/history  —  last 10 completed/failed jobs from DB
+router.get("/jobs/history", async (req, res) => {
+  try {
+    const history = await AdminJob.find()
+      .sort({ startedAt: -1 })
+      .limit(10)
+      .lean();
+    res.json({ ok: true, history });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: "Failed to fetch history" });
+  }
 });
 
 // GET /admin/jobs/:id  —  get one job's details
