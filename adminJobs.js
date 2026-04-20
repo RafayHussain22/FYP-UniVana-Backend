@@ -13,7 +13,7 @@ const { spawn } = require("child_process");
 const path = require("path");
 
 // Where the scrapper scripts live (sibling directory)
-const SCRAPPERS_DIR = path.resolve(__dirname, "../FYP-UniVana-Scrappers");
+const SCRAPPERS_DIR = path.resolve(__dirname, "../Scrappers");
 
 // Python command — override with PYTHON_CMD env var on Windows (e.g. "python" or "py")
 const PYTHON = process.env.PYTHON_CMD || "python3";
@@ -28,7 +28,7 @@ const SCRIPTS = {
   },
   countriesScrapper: {
     command: PYTHON,
-    args: ["countries_scrapper"],
+    args: ["countries_scrapper.py"],
     cwd: SCRAPPERS_DIR,
     label: "Countries Scrapper",
   },
