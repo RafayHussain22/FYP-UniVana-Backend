@@ -5,23 +5,29 @@ const Program = require("../models/program");
 const Country = require("../models/country");
 const ChatHistory = require("../models/chatHistory");
 const auth = require("../middleware/auth");
+const { embedQuery, vectorSearch, mergeResults } = require("../lib/retrieval");
 
 const router = express.Router();
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 
-const SYSTEM_PROMPT = `You are UniVana Assistant, a helpful chatbot for UniVana — a study abroad university discovery platform focused on European universities.
+// If the best vector match has cosine < this, we refuse instead of calling
+// Groq. 0.55 is a starting value — log lines below help tune it.
+const THRESHOLD = 0.55;
 
-You help users find universities, programs, and countries for studying abroad in Europe.
+const REFUSAL =
+  "I don't have that in my database. Try searching for universities or countries directly, or ask about France, Germany, Italy, Norway, or Sweden.";
 
-RULES:
-1. Use the DATABASE CONTEXT provided below to answer questions. Be specific — mention university names, program details, cities, etc.
-2. If the database context is empty or doesn't contain relevant information, you can still help with general study abroad advice, but clearly say "Based on my general knowledge" to distinguish from database-backed answers.
-3. Keep responses concise (2-4 sentences for simple questions, more for detailed ones).
-4. Be friendly and encouraging about studying abroad.
-5. If asked about something completely unrelated to education/universities, politely redirect to study abroad topics.`;
+// Strict prompt for Policy B — the model is told NOT to use general knowledge.
+const SYSTEM_PROMPT = `You are UniVana Assistant, a chatbot for UniVana — a study abroad platform focused on European universities (France, Germany, Italy, Norway, Sweden).
 
-// Country name → database identifiers mapping
+STRICT RULES:
+1. Answer ONLY using the DATABASE CONTEXT below. Do not use general knowledge.
+2. If the DATABASE CONTEXT does not contain enough information to answer the user's question, reply with exactly: "I don't have that in my database."
+3. Do NOT invent universities, programs, cities, or facts.
+4. Keep responses concise (2-4 sentences for simple questions, more for detailed ones).
+5. Be friendly and encouraging.`;
+
 const COUNTRIES = {
   france:  { slug: "france",  iso2: "FR" },
   germany: { slug: "germany", iso2: "DE" },
@@ -30,13 +36,31 @@ const COUNTRIES = {
   sweden:  { slug: "sweden",  iso2: "SE" },
 };
 
-// Checks if the user's message mentions a country name
 function detectCountry(message) {
   const lower = message.toLowerCase();
   for (const [name, data] of Object.entries(COUNTRIES)) {
     if (lower.includes(name)) return data;
   }
   return null;
+}
+
+// Minimal greeting allow-list — these skip retrieval entirely.
+const GREETING_RE = /^(hi|hello|hey|thanks|thank you|bye|goodbye|who are you|what can you do)[\s!.?]*$/i;
+
+function greetingReply(msg) {
+  const m = msg.toLowerCase().replace(/[\s!.?]+$/, "").trim();
+  if (m === "hi" || m === "hello" || m === "hey") {
+    return "Hi! I'm the UniVana Assistant. Ask me about universities, programs, or countries — France, Germany, Italy, Norway, or Sweden.";
+  }
+  if (m.startsWith("thank")) return "You're welcome!";
+  if (m === "bye" || m === "goodbye") return "Goodbye — happy studying!";
+  if (m === "who are you") {
+    return "I'm UniVana Assistant — I help you discover European universities and study programs.";
+  }
+  if (m === "what can you do") {
+    return "I can help you explore universities, study programs, and countries (France, Germany, Italy, Norway, Sweden). Just ask!";
+  }
+  return "Hello!";
 }
 
 // Soft auth — tries to authenticate but doesn't block if no token
@@ -51,6 +75,23 @@ function softAuth(req, res, next) {
   next();
 }
 
+async function persist(userId, userMsg, assistantMsg) {
+  await ChatHistory.findOneAndUpdate(
+    { userId },
+    {
+      $push: {
+        messages: {
+          $each: [
+            { role: "user", content: userMsg },
+            { role: "assistant", content: assistantMsg },
+          ],
+        },
+      },
+    },
+    { upsert: true }
+  );
+}
+
 // GET / — load chat history (requires login)
 router.get("/", auth, async (req, res) => {
   try {
@@ -62,7 +103,7 @@ router.get("/", auth, async (req, res) => {
   }
 });
 
-// POST / — send a message and get AI reply
+// POST / — send a message and get an AI reply
 router.post("/", softAuth, async (req, res) => {
   try {
     const message = String(req.body.message || "").trim();
@@ -72,77 +113,104 @@ router.post("/", softAuth, async (req, res) => {
       return res.status(400).json({ ok: false, message: "Message is required" });
     }
 
-    // 1. Search the database for relevant context
-    const textQuery = { $text: { $search: message } };
+    // 1. Greeting fast-path — skip retrieval and Groq entirely.
+    if (GREETING_RE.test(message)) {
+      const reply = greetingReply(message);
+      if (req.user) await persist(req.user.id, message, reply);
+      return res.json({ ok: true, reply });
+    }
+
+    // 2. Detect country mention (used to filter both lexical and vector).
     const detected = detectCountry(message);
 
-    // Build a regex from the longer words in the message (3+ chars) for name matching
-    const keywords = message
-      .replace(/[^a-zA-Z ]/g, "")
-      .split(/\s+/)
-      .filter((w) => w.length >= 3);
-    const nameRegex = keywords.length
-      ? new RegExp(keywords.join("|"), "i")
-      : null;
+    // 3. Embed the query + (if a country was detected) look up its uni slugs
+    //    so program search can be scoped to that country.
+    const [queryVec, uniSlugs] = await Promise.all([
+      embedQuery(message),
+      detected
+        ? University.find({ country_id: detected.iso2 }, { slug: 1 })
+            .lean()
+            .then((rows) => rows.map((u) => u.slug))
+        : Promise.resolve(null),
+    ]);
 
-    // Country filter: include docs where country matches OR country is missing
-    const uniQuery = detected
-      ? { ...textQuery, country_id: detected.iso2 }
-      : textQuery;
-    const progQuery = detected
-      ? { ...textQuery, country: { $in: [detected.slug, null, undefined] } }
-      : textQuery;
-    const countryQuery = detected
-      ? { ...textQuery, _id: detected.iso2 }
-      : textQuery;
+    // 4. Build lexical queries.
+    const textQ = { $text: { $search: message } };
+    const uniLexQ = detected ? { ...textQ, country_id: detected.iso2 } : textQ;
+    const progLexQ =
+      detected && uniSlugs?.length
+        ? { ...textQ, university_slug: { $in: uniSlugs } }
+        : textQ;
+    const countryLexQ = detected ? { ...textQ, _id: detected.iso2 } : textQ;
 
-    // Run text search + regex name search in parallel
-    const [universities, textPrograms, namePrograms, countries] = await Promise.all([
-      University.find(uniQuery, { score: { $meta: "textScore" } })
+    // 5. Build vector filters (must use fields declared as filter on the index).
+    const uniVecFilter = detected ? { country_id: detected.iso2 } : null;
+    const progVecFilter =
+      detected && uniSlugs?.length ? { university_slug: { $in: uniSlugs } } : null;
+
+    // 6. Fire all six retrievals in parallel.
+    const [
+      uniLex, uniVec,
+      progLex, progVec,
+      countryLex, countryVec,
+    ] = await Promise.all([
+      University.find(uniLexQ, { score: { $meta: "textScore" } })
         .sort({ score: { $meta: "textScore" } })
         .limit(10)
         .lean(),
-      Program.find(progQuery, { score: { $meta: "textScore" } })
+      vectorSearch(University, queryVec, 10, uniVecFilter),
+      Program.find(progLexQ, { score: { $meta: "textScore" } })
         .sort({ score: { $meta: "textScore" } })
         .limit(20)
         .lean(),
-      nameRegex
-        ? Program.find(
-            detected
-              ? { name: nameRegex, country: { $in: [detected.slug, null, undefined] } }
-              : { name: nameRegex }
-          )
-            .limit(10)
-            .lean()
-        : Promise.resolve([]),
-      Country.find(countryQuery, { score: { $meta: "textScore" } })
+      vectorSearch(Program, queryVec, 20, progVecFilter),
+      Country.find(countryLexQ, { score: { $meta: "textScore" } })
         .sort({ score: { $meta: "textScore" } })
         .limit(5)
         .lean(),
+      vectorSearch(Country, queryVec, 5, null),
     ]);
 
-    // Merge text search and name search results, removing duplicates
-    const seenIds = new Set(textPrograms.map((p) => p._id.toString()));
-    const extraPrograms = namePrograms.filter((p) => !seenIds.has(p._id.toString()));
-    const programs = [...textPrograms, ...extraPrograms];
+    // 7. Threshold gate — based on the best raw vector score across all
+    //    three collections. Cosine similarity is the only signal that's
+    //    directly comparable to a fixed threshold.
+    const maxVec = Math.max(
+      0,
+      ...uniVec.map((d) => d.vecScore || 0),
+      ...progVec.map((d) => d.vecScore || 0),
+      ...countryVec.map((d) => d.vecScore || 0)
+    );
 
-    // 2. Format database results into a readable context string
+    console.log(
+      `[chat] q="${message.slice(0, 60)}" maxVec=${maxVec.toFixed(
+        3
+      )} country=${detected?.slug || "-"} gate=${maxVec >= THRESHOLD ? "PASS" : "REFUSE"}`
+    );
+
+    if (maxVec < THRESHOLD) {
+      if (req.user) await persist(req.user.id, message, REFUSAL);
+      return res.json({ ok: true, reply: REFUSAL });
+    }
+
+    // 8. Merge lexical + vector per collection for ranking quality.
+    const universities = mergeResults(uniLex, uniVec, 10);
+    const programs = mergeResults(progLex, progVec, 20);
+    const countries = mergeResults(countryLex, countryVec, 5);
+
+    // 9. Build the context string for the LLM.
     let context = "";
-
     if (universities.length) {
       context += "UNIVERSITIES:\n";
       universities.forEach((u) => {
         context += `- ${u.name} | City: ${u.city || "N/A"} | Country: ${u.country_id} | Founded: ${u.founded_year || "N/A"} | Students: ${u.students?.total || "N/A"} (${u.students?.international_percent || "N/A"}% international)\n`;
       });
     }
-
     if (programs.length) {
       context += "\nPROGRAMS:\n";
       programs.forEach((p) => {
         context += `- ${p.name} | Degree: ${p.degree || "N/A"} | Discipline: ${p.discipline || "N/A"} | Duration: ${p.duration || "N/A"} | University: ${p.university_slug || "N/A"}\n`;
       });
     }
-
     if (countries.length) {
       context += "\nCOUNTRIES:\n";
       countries.forEach((c) => {
@@ -150,11 +218,7 @@ router.post("/", softAuth, async (req, res) => {
       });
     }
 
-    if (!context) {
-      context = "No matching results found in the database for this query.";
-    }
-
-    // 3. Build the conversation messages for Groq
+    // 10. Call Groq with the last 6 turns + new message.
     const recentHistory = history.slice(-6);
     const groqMessages = [
       { role: "system", content: `${SYSTEM_PROMPT}\n\nDATABASE CONTEXT:\n${context}` },
@@ -162,7 +226,6 @@ router.post("/", softAuth, async (req, res) => {
       { role: "user", content: message },
     ];
 
-    // 4. Call Groq API
     const groqRes = await fetch(GROQ_URL, {
       method: "POST",
       headers: {
@@ -176,32 +239,16 @@ router.post("/", softAuth, async (req, res) => {
     });
 
     const data = await groqRes.json();
-
     if (!groqRes.ok) {
       console.error("Groq API error:", data);
       return res.status(500).json({ ok: false, message: "AI service error" });
     }
 
-    const reply = data.choices?.[0]?.message?.content || "Sorry, I couldn't generate a response.";
+    const reply =
+      data.choices?.[0]?.message?.content ||
+      "Sorry, I couldn't generate a response.";
 
-    // 5. Save to chat history if user is logged in
-    if (req.user) {
-      await ChatHistory.findOneAndUpdate(
-        { userId: req.user.id },
-        {
-          $push: {
-            messages: {
-              $each: [
-                { role: "user", content: message },
-                { role: "assistant", content: reply },
-              ],
-            },
-          },
-        },
-        { upsert: true }
-      );
-    }
-
+    if (req.user) await persist(req.user.id, message, reply);
     res.json({ ok: true, reply });
   } catch (err) {
     console.error("Chat error:", err.message);
