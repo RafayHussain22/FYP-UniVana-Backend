@@ -41,6 +41,7 @@ router.post("/send-otp", async (req, res) => {
 
     res.json({ message: "OTP sent to email" });
   } catch (err) {
+    console.error("[auth] send-otp failed:", err);
     res.status(500).json({ message: err.message });
   }
 });
@@ -164,6 +165,7 @@ router.post("/forgot-password",async (req,res) =>{
     res.json({ message: "Password reset OTP sent to email" });
 
   } catch (error) {
+      console.error("[auth] forgot-password failed:", error);
       res.status(500).json({ message: error.message });
   }
 })
